@@ -4,8 +4,8 @@ This is test for Pico Technology
 
 Synopsis:
 ```
-	freqCall [-t] [-h] [path]
-		-t: print elapsed time
-		-h: print help and quit
-		path: directory where the wave files are located
+freqCall [-t] [-h] [path]
+	-t: print elapsed time
+	-h: print help and quit
+	path: directory where the wave files are located; default '.'
 ```
