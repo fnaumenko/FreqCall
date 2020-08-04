@@ -2,7 +2,7 @@
 freqCall - frequency recognition - recognition of frequencies recorded in files.
 This is test for Pico Technology
 
-Fedor Naumenko (fedor.naumenko@gmail.com), 26.07.2020
+Fedor Naumenko (fedor.naumenko@gmail.com), 04.08.2020
 
 Synopsis:
 	freqCall [-t] [-h] [path]
@@ -21,6 +21,8 @@ Synopsis:
 #include <locale>		// std::locale
 #include <cfloat>       // FLT_MAX
 
+const char LF = '\n';
+
 int main(int argc, char* argv[]) {
 	bool setTimer = false;
 	char* par = NULL;
@@ -29,7 +31,7 @@ int main(int argc, char* argv[]) {
 		char* opt = argv[i];
 		if (opt[0] == '-') {
 			if (opt[1] == 't')		setTimer = true;
-			else if (opt[1] == 'l')	cout.imbue(locale("English"));
+			//else if (opt[1] == 'l')	cout.imbue(locale("English"));
 			else if (opt[1] == 'h') {
 				cout << "frequency call: calculates the frequency in wave files.\n"
 					<< "freqCall [-t] [-h] [path]\n"
@@ -73,90 +75,192 @@ float WaveList::SMA::Push(float x)
 	return FLT_MIN;
 }
 
+// Fill subset by first value and return median
+//	it@: an iterator to the first value added
+float WaveList::SMM::Push(citer it)
+{
+	_v.clear();
+	for (short i = 0; i < _size; i++) {
+		_v.push_back(it->vl);
+		if (++it == _end)
+			return FLT_MIN;
+	}
+	sort(_v.begin(), _v.end());
+	return _v[_size / 2];				// value in the middle
+}
+
+//// Returns true if 2 floats are equal to epsilon
+//bool fless(float a, float b, const float epsilon = 0.00001) { return a < b + epsilon; }
+
+// Returns true if 2 floats are equal to epsilon
+inline bool fEq(float a, float b, const float epsilon) { return fabs(a - b) < epsilon; }
+
+inline bool VlEq(float a, float b) { return fEq(a, b, 0.0001f); }
+//inline bool TmEq(float a, float b) { return fEq(a, b, 1e-8); }
+
+
+#ifdef _DEBUG
+inline void Point::Print() const { cout << setw(10) << tm << ": " << setw(10) << left << vl; }
+#endif
+
 // Extract values from line
-bool ParseLine(const string& line, float& tm, float& vl)
+//	return: true if the values could not be retrieved, false if alright
+bool ParseLine(const string& line, Point& pt)
 {
 	istringstream iss(line);
-	if (!(iss >> tm))	return true;
-	iss.get();						// skip comma
-	if (!(iss >> vl))	return true;
+	if (!(iss >> pt.tm))	return true;
+	iss.get();				// skip comma
+	if (!(iss >> pt.vl))	return true;
 	return false;
 }
 
+// Returns true if two floats have diferent sign
+inline bool DiffSign(float a, float b) { return a * b < 0.0f; }
+
 // Initializes the created instance
 //	@fname: file name
-WaveList::File_freq::File_freq(const string& fname)	: _fname(fname), _freq(0)
+WaveList::FileFreq::FileFreq(const string& fname)	: _fname(fname), _freq(0)
 {
-	fstream fs(_fname, ios::in);
-	if (!fs.is_open())	return;
+	fstream fs(fname , ios::in);
+	if (!fs.is_open())			return;
 
-	const int initCnt = 3;					// count of first pre-read lines
-	string line;							// current read line
-	int i = 0, k = initCnt;					// full period counter, line counter
-	float	tm, vl, sum_tm = 0,				// current time (sec), value (volts), sum of all periods
-			prev_tm = 0, prev_vl = FLT_MIN,	// previous time, value
-			min_vl = FLT_MAX,		// current min value; some problrms with compilation using std::numeric_limits
-			max_vl = -FLT_MAX,		// current max value
-			diff = 0;		// difference between lower and upper noise levels
-	int	climbs = 0;			// continuous ascent counter: incremented if each next value is more than prev one
-	bool get_diff = true;	// if true than accumulate noise difference
-	SMA sma(10);			// splicer
-	
-	float vls[initCnt];
+	const int AR_Part = 3;	// minimum part of amplitude range defining a jump 
+	int ptCnt = 0;			// approximate number of points in the period
+	int n = 0;				// full period counter, general counter
+	float prev_vl = FLT_MIN;// previous time, value
+	float vl, sum_tm = 0;	// current value (volts), time sum
+	float tolerance;		// the size of the error,
+							// above which the difference between points is taken into account
+	vector<Point> pts;		// time-value collection from file
+	bool jumped = false;	// true if signal is jumping
+	bool noisy;				// true if signal is noisy
+	bool suppos = false;	// true if signal is superposition of waves of different frequencies (modulated)
+	char sFactor = 1;		// sign factor: if 1 then counting summits (at the beginning of the fall),
+							// if -1, then counting bottoms (at the beginning of the rise)
 
-	getline(fs, line);					// skip title
-	for (int x = 0; x < initCnt; x++) {	// pre-read lines
-		if(!getline(fs, line) && ParseLine(line, tm, vls[x]))		return;
-		sma.Push(vls[x]);				// fill splicer's buffer
-	}
-	bool flat = true;
-	diff = 0;
-	for (int x = 1; x < initCnt; x++) {
-		if (vls[x] != vls[x - 1]) {
-			flat = false;
-			float diff0 = vls[x] - vls[x - 1];
-			if (diff0 > 0)
-				climbs++;
-			if (abs(diff0) > diff)	diff = abs(diff0);
+	// *** read signal from file and define signal signs and factors
+	// The block can be formatted as a method with 5 in-out parameters 
+	// (when combining three boolean variables into one bitset)
+	{
+		float prev_vl = FLT_MIN;	// previous time; some problrms with compilation using std::numeric_limits
+		float min_vl = FLT_MAX;		// current min value
+		float max_vl = -FLT_MAX;	// current max value
+		float prev_diff = -FLT_MAX;	// previous difference between closest values
+		float min_tm = 0;			// time of first min value
+		float diff = 0;				// difference between lower and upper values
+		bool countMax = true;		// true if maximum are counted
+		int diffSignCnt = 0;		// counter of different sign cases
+		string line;				// current read line
+		Point pt;
+
+		// *** fill time-value collection and define if it's noisy
+		pts.reserve(50);
+		getline(fs, line);			// skip title
+		while (getline(fs, line)) {
+			if (ParseLine(line, pt))	return;
+			pts.push_back(pt);
+
+			if (prev_vl != FLT_MAX) {
+				diff = prev_vl - pt.vl;
+				if (ptCnt++ < 10) {
+					if (prev_diff != -FLT_MAX)
+						diffSignCnt += DiffSign(diff, prev_diff);
+					prev_diff = diff;
+				}
+			}
+			prev_vl = pt.vl;
 		}
-	}
-	//diff *= 5;
-	prev_vl = vls[initCnt-1];
+		noisy = diffSignCnt > 2;
 
-	while (getline(fs, line)) {
-		if (ParseLine(line, tm, vl))	return;
-
-		//if (!flat) {
-		//	float vl1 = sma.Push(vl);
-		//	if (vl1 != FLT_MIN)
-		//		vl = vl1;
-		//}
-		k++;
-		if (vl >= prev_vl) {
-			if (max_vl < vl)
-				max_vl = vl;
-			climbs++;
+		// the fisrt part of the collection scanned to determine the parameters 
+		const int ScanedPART = pts.size() > 1000 ? 4 : 2;
+		citer it_end = pts.begin() + pts.size() / ScanedPART;	// end of first part
+		// *** define max, min vals within first part
+		for (auto it = pts.begin(); it != it_end; it++)
+			if (it->vl >= max_vl) {
+				if (!countMax)		min_tm = it->tm;
+				max_vl = it->vl;
+			}
+			else if (it->vl <= min_vl) {
+				min_vl = it->vl;
+				min_tm = it->tm;
+				countMax = false;
+			}
+		
+		// *** define if signal is jumping
+		tolerance = max_vl - min_vl;
+		float critDiff = tolerance / AR_Part;
+		prev_vl = pts[1].vl;
+		for (auto it = pts.begin() + 2; it != it_end; it++) {
+			diff = prev_vl - it->vl;
+			if (fabs(diff) > critDiff) {
+				jumped = true;
+				if(diff < 0)	sFactor = -1;
+				break;
+			}
+			prev_vl = it->vl;
 		}
-		else {
-			if (min_vl > vl)	min_vl = vl;
-			if (flat || climbs > 2 || (diff && (prev_vl - vl) > diff)) {			// count from the second round
-				sum_tm += tm - prev_tm;
-				i++;
-				get_diff = false;
-				prev_tm = tm;
-				climbs = 0;
+		ptCnt = min_tm / (pts[1].tm - pts[0].tm);
+
+		// *** define if signal is frequency overlay
+		if (!jumped && !noisy) {
+			prev_vl = pts[0].vl;
+			for (citer it = pts.begin() + 1; it != it_end; it++) {
+				diff = prev_vl - it->vl;
+				if (it->vl < max_vl && diff > 0) {
+					suppos = true;
+					break;
+				}
+				if(VlEq(it->vl, max_vl))	break;
+				prev_vl = it->vl;
 			}
 		}
-		prev_vl = vl;
-		if (get_diff && max_vl != -FLT_MAX && min_vl != FLT_MAX)
-			diff = max(diff, 5 * abs(max_vl - min_vl));
-	}
-	i--;
+		tolerance /= AR_Part;
+		if (!jumped)	tolerance /= ptCnt;
 #ifdef _DEBUG
-	cout << _fname << "\ti: " << i << "  max_vl: " << max_vl << "  mean: " << (sum_tm / i) << '\n';
+		cout << fname << "  noisy: " << (noisy ? "YES" : "NO ") << "  jumped: " << (jumped ? "YES" : "NO ")
+			<< "  superpos: " << (suppos ? "YES" : "NO ") << " points: " << ptCnt << "  min_tm: " << min_tm
+			<< "  tolerance: " << tolerance << LF;
 #endif
-	_freq = i / sum_tm;
+	}
+
+	// *** calculate frequency
+	SMA sma(pts.size() > 2000 || suppos ? 20 : 4);				// Average splicer
+	SMM smm(noisy ? ptCnt / 40 : (suppos ? 7 : 1), pts.cend());	// Median splicer
+	float tm0 = 0;		// start counting time
+	bool splice = suppos || (noisy && !jumped);
+	bool grow = true;	// if true then signal is growing
+	
+	n = 0;
+	prev_vl = pts[0].vl;
+	if(splice)	sma.Push(smm.Push(pts.begin()));
+	for (auto it = pts.begin() + 1; it != pts.end(); it++) {
+		vl = splice ? sma.Push(smm.Push(it)) : it->vl;
+		if (sFactor * (prev_vl - vl) > tolerance) {
+			if (grow) {				// counting the beginning of the fall(growth) is done once,
+									// after which it is blocked
+				if (n)	sum_tm = it->tm;
+				else	tm0 = it->tm;
+				n++;
+				grow = false;		// blocking further counting in the same direction
+			}
+		}
+		else	grow = true;		// shange direction: unblocking counting
+		prev_vl = vl;
+		//cout << it->tm << '\t' << vl << LF;
+	}
+
+	_freq = --n / (sum_tm - tm0);
+#ifdef _DEBUG
+	cout << "\tn: " << n << LF;
+#endif
 }
+
+void WaveList::FileFreq::Print() const
+{
+	cout << _fname << '\t' << std::setprecision(4) << (_freq / 1000) << LF;
+}
+
 
 bool WaveList::GetFiles(const string& dirName, const string& ext)
 {
@@ -168,13 +272,17 @@ bool WaveList::GetFiles(const string& dirName, const string& ext)
 	int i = 0,  count = 0;
 	do	count++;
 	while (FindNextFile(hFind, &ffd));
-	files.reserve(count);
+	_files.reserve(count);
 	// fill files
+#ifndef _DEBUG
 	cout << setw(3) << 0 << '/' << count << '\r';
+#endif
 	hFind = FindFirstFile(fileTempl.c_str(), &ffd);
 	do {
-		files.push_back(File_freq(ffd.cFileName));
+		_files.push_back(FileFreq(ffd.cFileName));
+#ifndef _DEBUG
 		cout << setw(3) << ++i << '\r';
+#endif
 	}
 	while (FindNextFile(hFind, &ffd));
 	FindClose(hFind);
@@ -183,21 +291,22 @@ bool WaveList::GetFiles(const string& dirName, const string& ext)
 
 WaveList::WaveList(const char* path)
 {
-	if (GetFiles(path, ext)) {
+	if (GetFiles(path, Ext)) {
 		cout << LF;
-		sort(files.begin(), files.end());
+#ifndef _DEBUG
+		sort(_files.begin(), _files.end());
+#endif
 	}
-	else cerr << "No files *." << ext << " in given directory" << LF;
+	else cerr << "No files *." << Ext << " in given directory" << LF;
 }
 
 void WaveList::Print() const
 {
-	if (files.size()) {
+	if (_files.size()) {
 		cout << "file\t\tfreq, kHz\n";
-		for (const auto& s : files)	s.Print();
+		for (const auto& s : _files)	s.Print();
 	}
 }
-
 
 /************************ end of WaveList ************************/
 
@@ -219,6 +328,13 @@ bool FS::IsExist(const char* name, int st_mode)
 	}
 	else res = _stat64(name, &st);
 	return (!res && st.st_mode & st_mode);
+}
+
+// Gets size of file or -1 if file doesn't exist
+LLONG FS::Size(const char* fname)
+{
+	struct __stat64 st;
+	return __stat64(fname, &st) == -1 ? -1 : st.st_size;
 }
 
 // Returns the name ended by slash without checking
